@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { IFiles, IFormData } from '../../../types';
-import type { StageOutcome } from '../../../types/taskRun';
+import type { StageOutcome, TaskRun } from '../../../types/taskRun';
 import { resolveSubtitleOutputFormats } from '../../../types/subtitleOutput';
 import { runWithTaskContext, getTaskContext } from '../taskContext';
 import {
@@ -434,8 +434,15 @@ export function createDesktopStageExecutor(sender: any) {
         getTaskContext()!.stageOutputDirectory = workspace;
         ctx.afterSettlement?.(async () => {
           liveWorkspaces.delete(workspace);
+          // Only this attempt knows its workspace, so only this file's record (and the
+          // JSON it points at) can still reference it. Scanning the whole batch here
+          // read every other file's metadata again after every stage.
           await cleanupWorkspace(workspace, [
-            getRunStore().read(ctx.run.projectId, ctx.run.runId),
+            getRunService().getFile(
+              ctx.run.projectId,
+              ctx.run.runId,
+              ctx.file.fileId,
+            )?.file,
           ]);
         });
         const file: any = {
@@ -500,12 +507,24 @@ export function createDesktopStageExecutor(sender: any) {
             );
           await getTaskContext()!.verifyInput!();
         }
+        // Reuse compares this file with the same file of the previous run only.
+        const previousFile = ctx.run.previousRunId
+          ? getRunService().getFile(
+              ctx.run.projectId,
+              ctx.run.previousRunId,
+              ctx.file.fileId,
+            )
+          : null;
         const decision = await decideStageReuse({
           run: ctx.run,
           file: ctx.file,
           stageId,
-          previous: ctx.run.previousRunId
-            ? getRunService().get(ctx.run.projectId, ctx.run.previousRunId)
+          previous: previousFile
+            ? ({
+                projectId: ctx.run.projectId,
+                runId: ctx.run.previousRunId,
+                files: previousFile.file ? [previousFile.file] : [],
+              } as TaskRun)
             : null,
           artifacts,
           signal: ctx.signal,

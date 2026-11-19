@@ -7,7 +7,12 @@ import { assertValidRunInput, createTaskRunService } from './service';
 import { captureEffectiveConfiguration } from './configuration';
 import { configurationManager } from '../../service/configurationManager';
 import { store } from '../store';
-import { getWorkItemById, getWorkItems, saveWorkItem } from '../workItemStore';
+import {
+  adoptWorkItem,
+  flushWorkItemStore,
+  getWorkItemById,
+  getWorkItems,
+} from '../workItemStore';
 import { buildTaskName } from '../workItemMigration';
 import { withValidTranslateContent } from '../../../types/translateContent';
 import { enforceSpeakerDiarizationTaskBoundary } from '../../../types/speakerDiarization';
@@ -50,11 +55,17 @@ export const runWorkItemStatus = (run: TaskRun): WorkItemStatus =>
       running: 'running',
     }) as const
   )[run.status];
+/**
+ * `run` must be the caller's own copy: the record adopts it instead of copying the
+ * whole batch twice more on every publication.
+ */
 export function projectRun(run: TaskRun, durable = true) {
   const old = getWorkItemById(run.projectId);
-  saveWorkItem(
+  // The previous record's files are replaced; its other fields are small.
+  const { pipelineFiles: _previousFiles, ...previous } = old ?? {};
+  adoptWorkItem(
     {
-      ...old,
+      ...structuredClone(previous),
       id: run.projectId,
       name:
         old?.name || run.name || buildTaskName(run.files.map((f) => f.input)),
@@ -88,7 +99,9 @@ export function projectRun(run: TaskRun, durable = true) {
       ],
       pipelineFiles: projectRunFiles(run),
     },
-    { durable },
+    // A projection is rebuilt from its manifest at startup, so progress of a running
+    // batch need not rewrite config.json more than every few seconds.
+    { durable, writeDelay: 5000 },
   );
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send('taskRunChange', run);
@@ -112,9 +125,11 @@ export function flushTaskRunProgress() {
 }
 export function getRunService() {
   return (singleton ??= createTaskRunService(getRunStore(), {
-    onChange: (run) => {
+    // Routine steps of a running batch are not written to config.json one by one:
+    // the manifest already holds them, and startup projects every run again.
+    onChange: (run, change) => {
       try {
-        projectRun(run);
+        projectRun(run, change?.durable !== false);
       } catch (error) {
         console.error(
           'Task run projection failed; manifest remains authoritative',
@@ -132,7 +147,16 @@ export function initializeTaskRuns() {
   // Retirement only hides the data. Reclaiming it is driven by the work-item deletion
   // pipeline (taskDataReclaim), once the WorkItem and dubbing transactions have
   // committed; the startup collector remains the fallback for anything left behind.
-  setTaskRunDeletion((ids) => getRunStore().prepareRetirement(ids));
+  setTaskRunDeletion((ids) => {
+    const retirement = getRunStore().prepareRetirement(ids);
+    return {
+      commit() {
+        retirement.commit();
+        getRunService().forget(ids);
+      },
+      rollback: retirement.rollback,
+    };
+  });
   setTaskRunEditGuard((input) => {
     const all = getRunStore().all();
     if (
@@ -185,7 +209,9 @@ export function initializeTaskRuns() {
       latest.get(run.projectId)!.createdAt < run.createdAt
     )
       latest.set(run.projectId, run);
-  for (const run of latest.values()) if (!run.legacy) projectRun(run);
+  // One write for every project instead of rewriting config.json once per project.
+  for (const run of latest.values()) if (!run.legacy) projectRun(run, false);
+  flushWorkItemStore();
 }
 /** An accepted input binding excludes all mutable legacy output/status fields. */
 export function taskInput(file: IFiles): IFiles {

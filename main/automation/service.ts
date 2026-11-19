@@ -411,7 +411,8 @@ export class AutomationService {
     const executionSignal = getTaskProjectSignal(projectId);
     while (isTaskProjectBusy(projectId)) {
       const item = getWorkItemById(projectId);
-      const run = taskRunService()?.get(projectId);
+      // Polled every 250 ms: the status is enough, without copying the batch.
+      const run = taskRunService()?.peek(projectId);
       if (run?.status === 'waiting_review') break;
       const job = ctx.jobId && this.jobs.get(ctx.jobId);
       if (job) {

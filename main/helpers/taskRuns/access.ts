@@ -87,7 +87,7 @@ export function requireTaskRunService(): TaskRunService {
 }
 export function assertLegacyTaskWriteAllowed(projectId: string): void {
   if (legacyBusy(projectId)) throw new Error('TASK_CONFIG_BUSY');
-  const run = taskRunService()?.get(projectId);
+  const run = taskRunService()?.peek(projectId);
   if (isRunLocked(run)) throw new Error('TASK_CONFIG_BUSY');
   if (run) throw new Error('TASK_RUN_READ_ONLY_USE_DRAFT');
 }

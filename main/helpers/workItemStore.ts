@@ -88,6 +88,7 @@ function applyInterruptedMarkToWorkItems() {
 
 let workItems: WorkItem[] = [];
 let writeTimer: NodeJS.Timeout | null = null;
+let writeDue = 0;
 let initialized = false;
 let hasPendingWrite = false;
 type DeleteTransaction = { commit: () => void; rollback: () => void };
@@ -109,8 +110,14 @@ function commitDeletion(items: WorkItem[], next: WorkItem[]): void {
   transaction?.commit();
 }
 
+/** One pending write, due at the earliest time any change asked for. */
 function scheduleWrite(delay = 800) {
-  if (writeTimer) return;
+  const due = Date.now() + delay;
+  if (writeTimer) {
+    if (writeDue <= due) return;
+    clearTimeout(writeTimer);
+  }
+  writeDue = due;
   writeTimer = setTimeout(() => {
     writeTimer = null;
     try {
@@ -226,15 +233,16 @@ export function getWorkItemById(id: string): WorkItem | null {
   return workItems.find((item) => item.id === id) || null;
 }
 
-export function saveWorkItem(
+function putWorkItem(
   item: WorkItem,
-  options: { durable?: boolean } = {},
+  durable?: boolean,
+  writeDelay?: number,
 ): WorkItem {
   assertTaskStorageWritable();
   const index = workItems.findIndex((existing) => existing.id === item.id);
   const now = Date.now();
   const next: WorkItem = normalizeProofreadStatus({
-    ...structuredClone(item),
+    ...item,
     updatedAt: item.updatedAt || now,
     createdAt: item.createdAt || now,
   });
@@ -243,14 +251,34 @@ export function saveWorkItem(
   if (index >= 0) updated[index] = next;
   else updated.unshift(next);
 
-  if (options.durable) {
+  if (durable) {
     commitWorkItems(updated);
   } else {
     workItems = updated;
     hasPendingWrite = true;
-    scheduleWrite();
+    scheduleWrite(writeDelay);
   }
-  return structuredClone(next);
+  return next;
+}
+
+export function saveWorkItem(
+  item: WorkItem,
+  options: { durable?: boolean } = {},
+): WorkItem {
+  return structuredClone(putWorkItem(structuredClone(item), options.durable));
+}
+
+/**
+ * Saves a record the caller assembled from its own private copies, without copying
+ * it twice more: a task run projection holds every file of the batch. The caller
+ * hands the object over and must not keep or modify it. `writeDelay` lets a record
+ * that can be rebuilt (a run projection) reach the disk later than the default.
+ */
+export function adoptWorkItem(
+  item: WorkItem,
+  options: { durable?: boolean; writeDelay?: number } = {},
+): void {
+  putWorkItem(item, options.durable, options.writeDelay);
 }
 
 export function deleteWorkItem(id: string): boolean {

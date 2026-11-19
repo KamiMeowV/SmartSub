@@ -40,7 +40,8 @@ export async function executeFileRun(options: {
 }): Promise<FileExecutionResult> {
   const { service, projectId, runId, fileId, signal, execute } = options;
   for (;;) {
-    const run = service.get(projectId);
+    // The run's settings and this file only; other files are not copied per stage.
+    const run = service.view(projectId, fileId);
     if (
       !run ||
       run.runId !== runId ||
@@ -79,7 +80,7 @@ export async function executeFileRun(options: {
       });
       if ('reviewRevision' in result) {
         service.waitForReview(token, result.projection, result.reviewRevision);
-        return service.get(projectId)?.status === 'cancelled'
+        return service.peek(projectId)?.status === 'cancelled'
           ? 'cancelled'
           : 'waiting_review';
       }

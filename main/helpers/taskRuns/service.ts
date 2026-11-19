@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import type { IFiles } from '../../../types';
 import {
@@ -49,36 +50,172 @@ export function assertValidRunInput(input: {
   )
     throw new Error('TASK_SUBMISSION_INVALID');
 }
+/** Run states in which stage steps are routine and may be published together. */
+const ROUTINE_STATUSES = new Set<TaskRun['status']>([
+  'preparing',
+  'queued',
+  'running',
+]);
+/**
+ * How long a running batch collects steps and progress before publishing them.
+ * Each publication copies, projects and sends the whole batch, so batches above
+ * 200 files publish less often (1 ms per file, at most once a second).
+ */
+export const publicationDelay = (run: Pick<TaskRun, 'files'>) =>
+  Math.min(1000, Math.max(200, run.files.length));
+interface CachedRun {
+  run: TaskRun;
+  /** The manifest the run was written to or read from, and that file's identity. */
+  manifest: string;
+  identity: string;
+}
+function manifestIdentity(manifest: string) {
+  try {
+    const stat = fs.statSync(manifest, { bigint: true });
+    return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch {
+    return '';
+  }
+}
 export function createTaskRunService(
   store: TaskRunStore,
   options: {
-    onChange?: (run: TaskRun) => void;
+    /** `durable: false` marks routine steps published together with others. */
+    onChange?: (run: TaskRun, change?: { durable: boolean }) => void;
     onProgress?: (run: TaskRun) => void;
   } = {},
 ) {
   const progressViews = new Map<string, TaskRun>();
+  /**
+   * The latest run each project committed in this session, exactly as written.
+   * Every transition used to read all of the project's manifests back from disk,
+   * which made each step of a large batch cost more than the one before.
+   */
+  const committed = new Map<string, CachedRun>();
+  /** Runs read from disk for single-file lookups (the previous run of a batch). */
+  const history = new Map<string, CachedRun>();
+  const historyKey = (projectId: string, runId: string) =>
+    `${projectId}\u0000${runId}`;
+  function remember(run: TaskRun): CachedRun {
+    const manifest = store.runPath(run.projectId, run.runId);
+    return { run, manifest, identity: manifestIdentity(manifest) };
+  }
+  /**
+   * A cached run is used while its manifest is still the file it came from; one
+   * rewritten or moved by anything else (storage migration) is read again.
+   */
+  function trusted(entry: CachedRun | undefined) {
+    if (!entry) return undefined;
+    try {
+      const manifest = store.runPath(entry.run.projectId, entry.run.runId);
+      if (
+        manifest === entry.manifest &&
+        manifestIdentity(manifest) === entry.identity
+      )
+        return entry.run;
+    } catch {
+      // An unreachable location is answered from disk, which reports it.
+    }
+    return undefined;
+  }
+  function latestCommitted(projectId: string) {
+    const entry = committed.get(projectId);
+    const run = trusted(entry);
+    if (entry && !run) committed.delete(projectId);
+    return run;
+  }
+  /**
+   * The project's run as this service holds it: the latest commit plus any progress
+   * not yet checkpointed. Stage steps change it in place instead of copying the
+   * whole batch first; a write that fails drops it, and the manifest on disk (the
+   * state before that step) is read again.
+   */
+  function live(projectId: string) {
+    return progressViews.get(projectId) ?? latestCommitted(projectId);
+  }
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const notificationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Projects whose latest committed step has not been published yet. */
+  const unpublished = new Set<string>();
+  function cancelPublication(projectId: string) {
+    clearTimeout(notificationTimers.get(projectId));
+    notificationTimers.delete(projectId);
+    unpublished.delete(projectId);
+  }
+  function publishPending(projectId: string) {
+    const view = progressViews.get(projectId);
+    if (view) {
+      // A view starts from the latest commit, so it also carries unpublished steps.
+      unpublished.delete(projectId);
+      options.onProgress?.(structuredClone(view));
+      return;
+    }
+    const latest = latestCommitted(projectId);
+    if (unpublished.delete(projectId) && latest)
+      options.onChange?.(structuredClone(latest), { durable: false });
+  }
+  function schedulePublication(run: TaskRun) {
+    if (notificationTimers.has(run.projectId)) return;
+    const timer = setTimeout(() => {
+      notificationTimers.delete(run.projectId);
+      try {
+        publishPending(run.projectId);
+      } catch (error) {
+        console.error('Task progress notification failed', error);
+      }
+    }, publicationDelay(run));
+    timer.unref?.();
+    notificationTimers.set(run.projectId, timer);
+  }
   function get(projectId: string, runId?: string) {
     const pending = progressViews.get(projectId);
     if (pending && (!runId || pending.runId === runId))
       return structuredClone(pending);
+    const latest = latestCommitted(projectId);
+    if (latest && (!runId || latest.runId === runId))
+      return structuredClone(latest);
     return runId
       ? store.read(projectId, runId)
       : store.list(projectId)[0] || null;
   }
-  function save(run: TaskRun) {
+  /**
+   * Commits a transition. Every transition reaches the manifest before this returns.
+   * Routine stage steps of a running batch are then published together with the next
+   * progress publication; anything else (commands, reviews, the end of a run) is
+   * published at once.
+   */
+  function save(run: TaskRun, mode: { routine?: boolean } = {}) {
+    const inPlace = run === live(run.projectId);
     run.revision++;
     run.updatedAt = Date.now();
-    store.write(run);
+    try {
+      store.write(run);
+    } catch (error) {
+      if (inPlace) {
+        // The step changed the held run before the write failed: forget it.
+        progressViews.delete(run.projectId);
+        committed.delete(run.projectId);
+        clearTimeout(timers.get(run.projectId));
+        timers.delete(run.projectId);
+      }
+      throw error;
+    }
+    history.delete(historyKey(run.projectId, run.runId));
+    const latest = committed.get(run.projectId);
+    // Lists put the newest run first; an older run never replaces it here.
+    if (!latest || latest.run.createdAt <= run.createdAt)
+      committed.set(run.projectId, remember(run));
     progressViews.delete(run.projectId);
     clearTimeout(timers.get(run.projectId));
     timers.delete(run.projectId);
+    if (mode.routine && ROUTINE_STATUSES.has(run.status)) {
+      unpublished.add(run.projectId);
+      schedulePublication(run);
+      return;
+    }
     // A committed transition supersedes any queued, less recent progress view.
-    clearTimeout(notificationTimers.get(run.projectId));
-    notificationTimers.delete(run.projectId);
+    cancelPublication(run.projectId);
     options.onChange?.(structuredClone(run));
-    return structuredClone(run);
   }
   function publishProgress(run: TaskRun) {
     run.revision++;
@@ -86,20 +223,7 @@ export function createTaskRunService(
     progressViews.set(run.projectId, run);
     // Coalesce before cloning/projecting the whole batch, not just before IPC.
     // Hashing and concurrent engines can report many updates in one frame.
-    if (!notificationTimers.has(run.projectId)) {
-      const timer = setTimeout(() => {
-        notificationTimers.delete(run.projectId);
-        const pending = progressViews.get(run.projectId);
-        if (!pending) return;
-        try {
-          options.onProgress?.(structuredClone(pending));
-        } catch (error) {
-          console.error('Task progress notification failed', error);
-        }
-      }, 200);
-      timer.unref?.();
-      notificationTimers.set(run.projectId, timer);
-    }
+    schedulePublication(run);
     if (!timers.has(run.projectId)) {
       // Progress is advisory; stage results and commands still commit at once.
       const timer = setTimeout(() => {
@@ -107,7 +231,7 @@ export function createTaskRunService(
         const pending = progressViews.get(run.projectId);
         if (!pending) return;
         try {
-          save(pending);
+          save(pending, { routine: true });
         } catch (error) {
           console.error('Task progress flush failed', error);
         }
@@ -154,13 +278,9 @@ export function createTaskRunService(
   }
   function owned(
     token: AttemptToken,
-    reuseProgress = false,
   ): { run: TaskRun; stage: StageRun } | null {
-    // Only progress callbacks mutate this unpublished working copy. Durable
-    // transitions/public readers retain independent copies for write failures.
-    const run =
-      (reuseProgress && progressViews.get(token.projectId)) ||
-      get(token.projectId);
+    // Checks come before any change: a step that is refused leaves the run as it was.
+    const run = live(token.projectId) ?? get(token.projectId);
     if (!run || run.runId !== token.runId) return null;
     const stage = run.files.find((f) => f.fileId === token.fileId)?.stages[
       token.stageId
@@ -174,6 +294,83 @@ export function createTaskRunService(
     list: store.list,
     flushProgress() {
       for (const run of [...progressViews.values()]) save(run);
+      // Steps waiting to be published together are published (durably) now.
+      for (const projectId of [...unpublished]) {
+        cancelPublication(projectId);
+        const latest = latestCommitted(projectId);
+        if (latest) options.onChange?.(structuredClone(latest));
+      }
+    },
+    /** The latest run's identity and status, without copying the batch. */
+    peek(projectId: string): Pick<TaskRun, 'runId' | 'status'> | null {
+      const run =
+        progressViews.get(projectId) ??
+        latestCommitted(projectId) ??
+        store.list(projectId)[0];
+      return run ? { runId: run.runId, status: run.status } : null;
+    },
+    /**
+     * The latest run with only the given file: a stage needs the run's settings and
+     * its own file, and copying every other file before each stage made each one of
+     * a large batch slower than the one before.
+     */
+    view(projectId: string, fileId: string): TaskRun | null {
+      const run = progressViews.get(projectId) ?? latestCommitted(projectId);
+      if (!run) {
+        const loaded = get(projectId);
+        return loaded
+          ? {
+              ...loaded,
+              files: loaded.files.filter((file) => file.fileId === fileId),
+            }
+          : null;
+      }
+      const { files, ...header } = run;
+      return {
+        ...structuredClone(header),
+        files: files
+          .filter((file) => file.fileId === fileId)
+          .map((file) => structuredClone(file)),
+      };
+    },
+    /**
+     * One file of a run, without copying or reading the whole batch: stages ask for
+     * their own file (and the same file in the previous run) many times per batch.
+     * Null when the run does not exist.
+     */
+    getFile(projectId: string, runId: string, fileId: string) {
+      let run = [progressViews.get(projectId), latestCommitted(projectId)].find(
+        (candidate) => candidate?.runId === runId,
+      );
+      if (!run) {
+        const key = historyKey(projectId, runId);
+        run = trusted(history.get(key));
+        if (!run) {
+          history.delete(key);
+          run = store.read(projectId, runId) ?? undefined;
+          if (run) {
+            history.set(key, remember(run));
+            // A batch only ever looks back at one earlier run.
+            while (history.size > 4)
+              history.delete(history.keys().next().value);
+          }
+        }
+      }
+      if (!run) return null;
+      const file = run.files.find((candidate) => candidate.fileId === fileId);
+      return { file: file ? structuredClone(file) : undefined };
+    },
+    /** A deleted project is answered from disk again, like one never run here. */
+    forget(projectIds: string[]) {
+      for (const projectId of projectIds) {
+        committed.delete(projectId);
+        for (const key of [...history.keys()])
+          if (key.startsWith(`${projectId}\u0000`)) history.delete(key);
+        progressViews.delete(projectId);
+        clearTimeout(timers.get(projectId));
+        timers.delete(projectId);
+        cancelPublication(projectId);
+      }
     },
     importLegacyResult(input: {
       projectId: string;
@@ -362,7 +559,8 @@ export function createTaskRunService(
         run.status = active(run) ? 'cancelling' : 'cancelled';
       }
       run.commands[input.requestId] = { fingerprint };
-      return save(run);
+      save(run);
+      return structuredClone(run);
     },
     beginStage(
       projectId: string,
@@ -370,7 +568,8 @@ export function createTaskRunService(
       fileId: string,
       stageId: StageId,
     ): AttemptToken {
-      const run = get(projectId);
+      // Every check below comes before the held run is changed in place.
+      const run = live(projectId) ?? get(projectId);
       if (!run || run.runId !== runId) throw new Error('TASK_RUN_CONFLICT');
       if (run.legacy) throw new Error('TASK_HISTORY_READ_ONLY');
       if (['paused', 'pausing'].includes(run.status))
@@ -394,11 +593,11 @@ export function createTaskRunService(
       stage.sequence = 0;
       stage.progress = 0;
       run.status = 'running';
-      save(run);
+      save(run, { routine: true });
       return { projectId, runId, fileId, stageId, attemptId: stage.attemptId };
     },
     progress(input: AttemptToken & { sequence: number; progress: number }) {
-      const found = owned(input, true);
+      const found = owned(input);
       if (
         !found ||
         input.sequence <= found.stage.sequence ||
@@ -411,7 +610,7 @@ export function createTaskRunService(
       return true;
     },
     activity(token: AttemptToken, activity: IFiles['taskActivity']) {
-      const found = owned(token, true);
+      const found = owned(token);
       if (!found) return false;
       found.run.files.find(
         (file) => file.fileId === token.fileId,
@@ -455,7 +654,7 @@ export function createTaskRunService(
         if (inputIdentity) file.inputIdentity = inputIdentity;
       }
       aggregate(found.run);
-      save(found.run);
+      save(found.run, { routine: true });
       return true;
     },
     failStage(token: AttemptToken, error: string) {
@@ -465,7 +664,7 @@ export function createTaskRunService(
         found.run.status === 'cancelling' ? 'cancelled' : 'failed';
       found.stage.error = error;
       aggregate(found.run);
-      save(found.run);
+      save(found.run, { routine: true });
       return true;
     },
     checkpoint(token: AttemptToken, projection: IFiles) {
@@ -493,7 +692,8 @@ export function createTaskRunService(
         input.translationFailures,
       );
       (file.projection as any).manualProofreadRevision = input.digest;
-      return save(run);
+      save(run);
+      return structuredClone(run);
     },
     waitForReview(token: AttemptToken, projection: IFiles, revision: string) {
       const found = owned(token);
@@ -538,7 +738,8 @@ export function createTaskRunService(
       });
       file.projection = structuredClone(input.projection);
       aggregate(run);
-      return save(run);
+      save(run);
+      return structuredClone(run);
     },
     recover() {
       for (const run of store.all({ skipUnsupported: true })) {
