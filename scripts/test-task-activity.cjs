@@ -201,7 +201,9 @@ async function main() {
   const retries = [];
   translate = async () => {
     calls++;
-    return 'invented unrelated content';
+    // A different wrong answer each round: one repeated verbatim ends the retries
+    // early on purpose (see test-ai-segmentation-runner.cjs).
+    return `invented unrelated content ${calls}`;
   };
   const fallback = await runAiSegmentation({
     cues: cues.slice(0, 1),
