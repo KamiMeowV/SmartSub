@@ -546,12 +546,19 @@ export function createDesktopStageExecutor(sender: any) {
           };
         }
         const activity = new TaskActivityReporter(
-          Date.now(),
+          // Always newer than the file's last activity, like the per-file reporter.
+          Math.max(
+            Date.now(),
+            (ctx.file.projection.taskActivity?.run ?? 0) + 1,
+          ),
           (state) => {
             file.taskActivity = state;
             ctx.activity(state);
           },
           ctx.signal,
+          // A stage without activity of its own (preparing proofreading, export…)
+          // keeps the file's latest activity, e.g. the translation's saved batches.
+          { silentUntilStarted: true },
         );
         getTaskContext()!.activity = activity;
         try {

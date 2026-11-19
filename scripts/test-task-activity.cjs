@@ -417,8 +417,51 @@ async function main() {
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
+
+  // A pipeline stage gets its own reporter. One that reports nothing must leave the
+  // file's latest activity (here the translation's saved batches) untouched.
+  const stageSent = [];
+  const quiet = new TaskActivityReporter(
+    5,
+    (a) => stageSent.push(a),
+    undefined,
+    {
+      silentUntilStarted: true,
+    },
+  );
+  quiet.close();
+  assert.deepEqual(stageSent, [], 'a stage without activity publishes nothing');
+  const quietAbort = new AbortController();
+  const aborted = new TaskActivityReporter(
+    6,
+    (a) => stageSent.push(a),
+    quietAbort.signal,
+    { silentUntilStarted: true },
+  );
+  quietAbort.abort();
+  aborted.close();
+  assert.deepEqual(
+    stageSent,
+    [],
+    'cancelling a silent stage publishes nothing',
+  );
+  const translating = new TaskActivityReporter(
+    7,
+    (a) => stageSent.push(a),
+    undefined,
+    { silentUntilStarted: true },
+  );
+  const scope = translating.start('translateSubtitle', 'preparing');
+  scope.update({ phase: 'translating', savedBatches: 2, units: [] });
+  scope.finish();
+  translating.close();
+  assert.equal(stageSent[0].stage, 'translateSubtitle');
+  assert.equal(stageSent.at(-1).status, 'done');
+  assert.equal(stageSent.at(-1).savedBatches, 2);
+  assert.equal(stageSent.at(-1).run, 7);
+
   console.log(
-    'Task activity integration passed: slow/concurrent requests, retries, fallback, cancellation, save boundary and empty input',
+    'Task activity integration passed: slow/concurrent requests, retries, fallback, cancellation, save boundary, empty input and silent stage reporters',
   );
 }
 

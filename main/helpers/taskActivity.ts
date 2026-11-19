@@ -5,16 +5,26 @@ export interface ActivityScope {
   update(detail: ActivityDetail): void;
   finish(status?: 'done' | 'error' | 'cancelled'): void;
 }
+export interface TaskActivityReporterOptions {
+  /**
+   * Publish nothing until a stage scope starts. A pipeline stage gets its own
+   * reporter; one that reports no activity of its own then leaves the file's latest
+   * activity as it was (with its summary, such as the saved translation batches),
+   * as a single reporter per file execution does.
+   */
+  silentUntilStarted?: boolean;
+}
 
 /** One reporter per file execution. Scopes reject callbacks from finished stages. */
 export class TaskActivityReporter {
   private snapshot: TaskActivity;
   private epoch = 0;
   private closed = false;
+  private silent = false;
   private timer?: ReturnType<typeof setTimeout>;
   private sentAt = 0;
   private readonly onAbort = () => {
-    if (this.snapshot.status !== 'running') return;
+    if (this.silent || this.snapshot.status !== 'running') return;
     this.snapshot = { ...this.snapshot, status: 'cancelling' };
     this.publish(true);
   };
@@ -23,6 +33,7 @@ export class TaskActivityReporter {
     run: number,
     private send: Send,
     private signal?: AbortSignal,
+    options: TaskActivityReporterOptions = {},
   ) {
     const now = Date.now();
     this.snapshot = {
@@ -35,14 +46,16 @@ export class TaskActivityReporter {
       phaseStartedAt: now,
       updatedAt: now,
     };
+    this.silent = options.silentUntilStarted === true;
     signal?.addEventListener('abort', this.onAbort, { once: true });
-    this.publish(true);
+    if (!this.silent) this.publish(true);
   }
 
   start(
     stage: TaskActivity['stage'],
     phase: ActivityDetail['phase'],
   ): ActivityScope {
+    this.silent = false;
     const epoch = ++this.epoch;
     const now = Date.now();
     this.snapshot = {
@@ -92,6 +105,11 @@ export class TaskActivityReporter {
 
   close() {
     if (this.closed) return;
+    if (this.silent) {
+      this.closed = true;
+      this.signal?.removeEventListener('abort', this.onAbort);
+      return;
+    }
     if (
       this.snapshot.status === 'running' ||
       this.snapshot.status === 'cancelling'
