@@ -98,6 +98,13 @@ try {
   });
   const page = await app.firstWindow();
   page.setDefaultTimeout(20_000);
+  page.on('dialog', (dialog) => {
+    // Reloading while the task page saves its draft raises "leave site?". The app
+    // answers it in the main process, so the prompt may already be gone here.
+    void (
+      dialog.type() === 'beforeunload' ? dialog.accept() : dialog.dismiss()
+    ).catch(() => {});
+  });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await waitForAppPage(page);
@@ -307,7 +314,9 @@ try {
       requestId: 'activity-fixture-retry',
       projectId,
       files: task.pipelineFiles,
-      formData: task.configSnapshot,
+      // Unchanged settings reuse every verified result without a request; force a
+      // new execution so its activity and its cancellation can be observed.
+      formData: { ...task.configSnapshot, forceRerun: true },
     });
   }, projectId);
   assert.equal(retry.success, true, JSON.stringify(retry));
