@@ -81,6 +81,8 @@ interface QueueItem {
   file: IFiles;
   formData: any;
   projectId: string;
+  /** The submission that queued this file: its sender receives the file's events. */
+  event?: any;
 }
 
 interface ProjectRuntime {
@@ -109,6 +111,14 @@ let activeTasksCount = 0;
 
 /** 最近一次 handleTask 的 event：resume 触发派发时复用 */
 let dispatchEvent: any = null;
+/**
+ * The single pending dispatch. Each finished file used to schedule its own 100 ms
+ * polling chain, so a batch of hundreds of files ended up with hundreds of chains
+ * re-running the dispatcher (and reading settings) many thousands of times a second.
+ */
+let dispatchTimer: ReturnType<typeof setTimeout> | null = null;
+let dispatchTimerDue = 0;
+let dispatchTimerEvent: any = null;
 /** Dock/任务栏进度条目标窗口 */
 let progressWindow: BrowserWindow | null = null;
 
@@ -147,7 +157,7 @@ export function isTranscriptionBusy(): boolean {
 
 export function isTaskProjectBusy(projectId: string): boolean {
   return (
-    isRunLocked(taskRunService()?.get(projectId)) ||
+    isRunLocked(taskRunService()?.peek(projectId)) ||
     (projectRuntimes.get(projectId)?.active || 0) > 0 ||
     processingQueue.some((item) => item.projectId === projectId)
   );
@@ -214,7 +224,7 @@ function finalizeProjectIfDrained(event: any, projectId: string) {
   const runtime = projectRuntimes.get(projectId);
   if (!runtime) return;
   if (runtime.active > 0 || queuedCount(projectId) > 0) return;
-  const run = taskRunService()?.get(projectId);
+  const run = taskRunService()?.peek(projectId);
   if (
     run &&
     ['paused', 'pausing', 'queued', 'running', 'preparing'].includes(run.status)
@@ -271,6 +281,7 @@ function startTaskRun(event: any, input: TaskSubmission): TaskSubmissionResult {
       formData,
       projectId: pid,
       runId: managed?.run.runId,
+      event,
     })),
   );
   runtime.total += files.length;
@@ -365,6 +376,7 @@ function queueManagedRun(
       runId: run.runId,
       file: file.projection,
       formData: run.config,
+      event,
     });
   }
   runtime.total = run.files.length;
@@ -392,7 +404,7 @@ export function enqueueProjectFiles(
 ): boolean {
   const event = backgroundEvent;
   try {
-    const run = taskRunService()?.get(projectId);
+    const run = taskRunService()?.peek(projectId);
     if (run && isRunLocked(run)) {
       queueManagedRun(
         projectId,
@@ -475,7 +487,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
 
   ipcMain.on('pauseTask', (event, projectId?: string) => {
     if (projectId) {
-      const run = taskRunService()?.get(projectId);
+      const run = taskRunService()?.peek(projectId);
       if (run)
         taskRunService()!.command({
           projectId,
@@ -488,7 +500,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
       return;
     }
     projectRuntimes.forEach((runtime, id) => {
-      const run = taskRunService()?.get(id);
+      const run = taskRunService()?.peek(id);
       if (run && isRunLocked(run))
         taskRunService()!.command({
           projectId: id,
@@ -503,7 +515,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
 
   ipcMain.on('resumeTask', (event, projectId?: string) => {
     if (projectId) {
-      const run = taskRunService()?.get(projectId);
+      const run = taskRunService()?.peek(projectId);
       if (run) {
         taskRunService()!.command({
           projectId,
@@ -519,7 +531,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
       ensureRuntime(projectId).paused = false;
     } else {
       projectRuntimes.forEach((runtime, id) => {
-        const run = taskRunService()?.get(id);
+        const run = taskRunService()?.peek(id);
         if (run?.status === 'paused') {
           taskRunService()!.command({
             projectId: id,
@@ -549,7 +561,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
           ]),
         );
     for (const id of ids) {
-      const run = taskRunService()?.get(id);
+      const run = taskRunService()?.peek(id);
       if (run && isRunLocked(run))
         taskRunService()!.command({
           projectId: id,
@@ -607,7 +619,7 @@ export function setupTaskProcessor(mainWindow: BrowserWindow) {
         : 'idle';
     }
     const runtime = projectRuntimes.get(projectId);
-    const run = taskRunService()?.get(projectId);
+    const run = taskRunService()?.peek(projectId);
     if (run)
       return ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(
         run.status,
@@ -702,6 +714,21 @@ function takeEligibleItems(limit: number): QueueItem[] {
   return taken;
 }
 
+/** Keeps at most one dispatch pending, the earliest one asked for. */
+function scheduleDispatch(event: any, delay: number) {
+  dispatchTimerEvent = event;
+  const due = Date.now() + delay;
+  if (dispatchTimer) {
+    if (dispatchTimerDue <= due) return;
+    clearTimeout(dispatchTimer);
+  }
+  dispatchTimerDue = due;
+  dispatchTimer = setTimeout(() => {
+    dispatchTimer = null;
+    void processNextTasks(dispatchTimerEvent);
+  }, delay);
+}
+
 async function processNextTasks(event) {
   syncTranscriptionPowerSaveBlocker();
   // 队列与执行均清空：全局收工
@@ -720,10 +747,12 @@ async function processNextTasks(event) {
     const tasksToProcess = takeEligibleItems(availableSlots);
     if (tasksToProcess.length > 0) {
       const translationProviders = store.get('translationProviders');
+      const dispatchEventFallback = event;
 
       tasksToProcess.forEach(async (task) => {
         const runtime = ensureRuntime(task.projectId);
         const fileUuid = task.file?.uuid;
+        const event = task.event ?? dispatchEventFallback;
         activeTasksCount++;
         runtime.active++;
         if (fileUuid) runtime.activeFiles.add(fileUuid);
@@ -801,8 +830,8 @@ async function processNextTasks(event) {
   // 有任务在跑（100ms）或队列里还躺着暂停项（500ms）：保持轮询，
   // 这样 handleTask/resumeTask 之后的新增项总能被派发
   if (activeTasksCount > 0) {
-    setTimeout(() => processNextTasks(event), 100);
+    scheduleDispatch(event, 100);
   } else if (processingQueue.length > 0) {
-    setTimeout(() => processNextTasks(event), 500);
+    scheduleDispatch(event, 500);
   }
 }
