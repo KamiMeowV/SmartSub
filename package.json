@@ -3,6 +3,7 @@
   "name": "smartsub",
   "description": "视频转字幕，字幕翻译软件, 支持多种转写引擎 whisper.cpp, faster-whisper, FunASR, Qwen3-ASR, FireRedASR, NVIDIA Parakeet, Whisper CLI, 多种翻译服务, 支持硬件加速",
   "version": "3.12.2",
+  "displayVersion": "3.12.2.2",
   "author": "buxuku <buxuku@gmail.com>",
   "main": "app/background.js",
   "scripts": {
@@ -64,6 +65,7 @@
     "native:fetch": "node scripts/fetch-sherpa-native.mjs && node scripts/fetch-whisper-addon.mjs",
     "size:check": "node scripts/check-bundle-size.mjs",
     "test:release-checksum": "node --test scripts/test-refresh-update-checksum.mjs",
+    "test:display-version": "node --test scripts/test-display-version.mjs",
     "test:task-activity": "node scripts/test-task-activity.cjs && node scripts/test-translation-activity.cjs && jest --runInBand renderer/components/__tests__/TaskActivity.test.tsx",
     "test:e2e:task-activity": "node scripts/e2e/task-activity.mjs",
     "test:e2e:task-list-layout": "node scripts/e2e/task-list-layout.mjs",

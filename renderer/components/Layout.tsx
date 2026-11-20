@@ -74,7 +74,7 @@ import ShortcutsHelpDialog from './ShortcutsHelpDialog';
 import FaqDialog from './FaqDialog';
 import { useHotkeys, isMacPlatform } from 'hooks/useHotkeys';
 import { useRadixPointerEventsGuard } from 'hooks/useRadixPointerEventsGuard';
-import packageInfo from '../../package.json';
+import { appDisplayVersion } from 'lib/appVersion';
 import { deriveGpuDisplayState } from '@/components/settings/gpu/gpuDisplayState';
 import { backendDisplay } from '@/components/settings/gpu/gpuUtils';
 import type { GpuMode } from '../../types/addon';
@@ -1014,7 +1014,7 @@ const Layout = ({ children }) => {
               taskRunning={taskRunning}
               download={downloadPill}
               updateAvailable={updateAvailable}
-              version={packageInfo.version}
+              version={appDisplayVersion}
               newVersion={newVersion}
               onShowUpdate={handleUpdateClick}
             />
@@ -1246,7 +1246,7 @@ const Layout = ({ children }) => {
         )}
         <span className="flex-1" />
         <span className="tnum whitespace-nowrap font-mono text-[10.5px] text-faint">
-          v{packageInfo.version}
+          v{appDisplayVersion}
         </span>
       </footer>
 

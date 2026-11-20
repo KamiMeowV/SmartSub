@@ -1,5 +1,9 @@
 appId: com.example.smartsub
 productName: SmartSub
+# Shown version (installer names, Windows file version, macOS build number). It must
+# equal package.json `displayVersion`; package.json `version` stays semver, because
+# the updater refuses anything else and the app would not start.
+buildVersion: 3.12.2.2
 copyright: Copyright © 2024 buxuku
 directories:
   output: dist
@@ -45,7 +49,7 @@ mac:
   target:
     - zip
     - dmg
-  artifactName: '${productName}_Mac_${version}_${arch}.${ext}'
+  artifactName: '${productName}_Mac_${buildVersion}_${arch}.${ext}'
   extendInfo:
     # 声音克隆向导的麦克风录音入口（缺失该描述 macOS 会静默拒绝收音）
     NSMicrophoneUsageDescription: 'SmartSub needs microphone access to record your voice for voice cloning. SmartSub 需要使用麦克风录制您的声音以创建克隆音色。'
@@ -93,7 +97,7 @@ win:
       filter:
         - '**/*'
   requestedExecutionLevel: asInvoker
-  artifactName: '${productName}_Windows_${version}_${arch}.${ext}'
+  artifactName: '${productName}_Windows_${buildVersion}_${arch}.${ext}'
   publish:
     - provider: github
       channel: latest
@@ -103,7 +107,7 @@ linux:
     # - tar.gz
     - deb
   category: AudioVideo
-  artifactName: '${productName}_Linux_${version}_${arch}.${ext}'
+  artifactName: '${productName}_Linux_${buildVersion}_${arch}.${ext}'
   publish:
     - provider: github
       channel: latest

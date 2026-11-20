@@ -165,7 +165,9 @@ jobs:
 
           version=$(node -p "require('./package.json').version")
           # 文件名由 electron-builder.yml 的 artifactName 决定，SignPath 签名配置里也按这个名字匹配
-          installer="SmartSub_Windows_${version}_x64.exe"
+          # artifactName 用的是 buildVersion，即 package.json 的 displayVersion（未设置时为 version）
+          build_version=$(node -p "const p = require('./package.json'); p.displayVersion || p.version")
+          installer="SmartSub_Windows_${build_version}_x64.exe"
 
           if [[ -n "$policy" ]]; then
             if [[ ! -f "dist/$installer" ]]; then

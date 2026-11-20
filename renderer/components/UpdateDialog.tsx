@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { Copy, Check, Download, ExternalLink } from 'lucide-react';
 import { openUrl } from 'lib/utils';
-import packageInfo from '../../package.json';
+import { appDisplayVersion } from 'lib/appVersion';
 
 interface UpdateDialogProps {
   open: boolean;
@@ -112,8 +112,8 @@ export function UpdateDialog({
         <DialogHeader>
           <DialogTitle>{t('updateDialogTitle')}</DialogTitle>
           <DialogDescription>
-            {t('currentVersion')}: v{packageInfo.version} → {t('latestVersion')}
-            : v{version}
+            {t('currentVersion')}: v{appDisplayVersion} → {t('latestVersion')}:
+            v{version}
           </DialogDescription>
         </DialogHeader>
 

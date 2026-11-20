@@ -71,7 +71,7 @@ import CustomLanguageManager from '@/components/settings/CustomLanguageManager';
 import McpConnectionCard from '@/components/settings/McpConnectionCard';
 import TaskStorageSettings from '@/components/settings/TaskStorageSettings';
 import { openUrl } from 'lib/utils';
-import packageInfo from '../../../package.json';
+import { appDisplayVersion } from 'lib/appVersion';
 import {
   DEFAULT_DOWNLOAD_ENDPOINTS,
   EDITABLE_DOWNLOAD_ENDPOINT_KEYS,
@@ -1677,7 +1677,7 @@ const Settings = () => {
               <div>
                 <div className="font-medium">{t('common:headerTitle')}</div>
                 <div className="font-mono text-sm text-muted-foreground">
-                  v{packageInfo.version}
+                  v{appDisplayVersion}
                 </div>
               </div>
               <Button
