@@ -33,6 +33,7 @@ import { runSpeakerDiarizationStage } from '../speakerDiarization/stage';
 import { annotateCuesWithSpeakers } from '../speakerDiarization/alignment';
 import {
   parseSubtitleCues,
+  parseSubtitleEntries,
   detectSubtitleFormatFromContent,
   serializeSubtitleCues,
 } from '../subtitleFormats';
@@ -104,6 +105,20 @@ async function writable(file: any, keys: string[], directory: string) {
     file[key] = target;
   }
 }
+/**
+ * A subtitle that exists but holds no cue: recognition of a clip in which nobody
+ * speaks. Parsed the way translation and proofread data read it, so this is true
+ * exactly when they would find nothing to work on.
+ */
+async function subtitleWithoutCues(filePath?: string) {
+  if (!filePath || !fs.existsSync(filePath)) return false;
+  const text = await fs.promises.readFile(filePath, 'utf8');
+  return (
+    parseSubtitleEntries(text, detectSubtitleFormatFromContent(filePath, text))
+      .length === 0
+  );
+}
+
 async function providers(config: Record<string, any>) {
   const all = store.get('translationProviders') || [];
   const primary = all.find((p) => p.id === config.translateProvider);
@@ -120,8 +135,9 @@ async function publish(
   desired: string,
   inputs: string[],
   signal?: AbortSignal,
+  options: { allowEmpty?: boolean } = {},
 ) {
-  const output = createComposeOutput(desired, inputs);
+  const output = createComposeOutput(desired, inputs, undefined, options);
   try {
     await copyIndependent(source, output.staged);
     await getTaskContext()?.verifyInput?.();
@@ -199,12 +215,15 @@ async function materializeReusedResult(
   if (ctx.stage.id === 'exportSubtitle') {
     file.sourceSubtitleFiles = [];
     file.translatedSubtitleFiles = [];
+    // A clip in which nobody speaks delivers empty subtitles.
+    const silent = await subtitleWithoutCues(file.tempSrtFile);
     for (const delivery of file.internalDeliverables || []) {
       const target = await publish(
         delivery.source,
         delivery.desired,
         [file.filePath, file.providedSubtitlePath].filter(Boolean),
         ctx.signal,
+        { allowEmpty: silent },
       );
       file[
         delivery.role === 'source'
@@ -299,6 +318,9 @@ async function exportSubtitles(
     config.taskType !== 'generateOnly' && config.translateProvider !== '-1';
   const canonicalSource = file.srtFile;
   const canonicalTarget = file.translatedSrtFile;
+  // A clip in which nobody speaks delivers empty subtitles; any other empty
+  // output is still an error.
+  const silent = await subtitleWithoutCues(canonicalSource);
   await writable(file, ['srtFile', 'translatedSrtFile'], workspace);
   let bilingual: Array<{ source: string; target: string }> | undefined;
   if (translationActive && file.translatedSrtFile) {
@@ -387,6 +409,7 @@ async function exportSubtitles(
         desired,
         [file.filePath, file.providedSubtitlePath].filter(Boolean),
         ctx.signal,
+        { allowEmpty: silent },
       );
       file[
         role === 'source' ? 'sourceSubtitleFiles' : 'translatedSubtitleFiles'
@@ -718,6 +741,16 @@ export function createDesktopStageExecutor(sender: any) {
               outcome = 'degraded';
               reason = file.summarizeEpisodeError;
             }
+          } else if (
+            stageId === 'translateSubtitle' &&
+            (await subtitleWithoutCues(file.srtFile))
+          ) {
+            // Nobody speaks, so there is nothing to translate: the translation is
+            // an equally empty subtitle, delivered like any other.
+            file.translatedSrtFile = path.join(workspace, 'translated.srt');
+            await fs.promises.writeFile(file.translatedSrtFile, '');
+            outcome = 'not_applicable';
+            reason = 'EMPTY_SUBTITLE';
           } else if (stageId === 'translateSubtitle') {
             const candidates = await providers(config);
             if (!candidates.length)
@@ -819,10 +852,21 @@ export function createDesktopStageExecutor(sender: any) {
               glossaryIds: config.glossaryIds,
               episodeSummary: file.episodeSummary,
             });
-            if (!('filePath' in result))
+            if ('filePath' in result) {
+              file.proofreadDataFile = result.filePath;
+              file.proofreadDataReady = 'done';
+            } else if (
+              result.reason === 'source-unavailable' &&
+              (await subtitleWithoutCues(file.srtFile))
+            ) {
+              // Nobody speaks in the clip: an empty subtitle has nothing to
+              // proofread, and the file completes. Proofreading stays closed for
+              // it, as it did before task runs.
+              file.proofreadDataReady = 'error';
+              outcome = 'not_applicable';
+              reason = 'EMPTY_SUBTITLE';
+            } else
               throw new Error(`TASK_PROOFREAD_WRITE_FAILED: ${result.reason}`);
-            file.proofreadDataFile = result.filePath;
-            file.proofreadDataReady = 'done';
           } else if (stageId === 'exportSubtitle') {
             await writable(file, ['proofreadDataFile'], workspace);
             await exportSubtitles(file, config, ctx, workspace);

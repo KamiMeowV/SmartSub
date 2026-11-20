@@ -44,6 +44,8 @@ export function createComposeOutput(
   desired: string,
   inputs: string[],
   onPublication?: (state: ComposePublicationState) => void,
+  /** `allowEmpty`: an empty file is a valid result (a subtitle of a silent clip). */
+  options: { allowEmpty?: boolean } = {},
 ) {
   if (!path.isAbsolute(desired) || !path.extname(desired))
     throw new Error('Output must be an absolute file path');
@@ -124,7 +126,7 @@ export function createComposeOutput(
       )
         throw new Error(`Output cannot replace an input file: ${target}`);
       const stat = fs.statSync(sources[index]);
-      if (!stat.isFile() || !stat.size)
+      if (!stat.isFile() || (!stat.size && !options.allowEmpty))
         throw new Error('FFmpeg produced no output');
       try {
         const completed = fs.openSync(sources[index], 'r+');
