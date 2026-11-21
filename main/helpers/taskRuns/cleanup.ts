@@ -16,12 +16,50 @@ export interface ReclaimReport extends CleanupReport {
 export const liveWorkspaces = new Set<string>();
 const media = /\.(wav|mp3|m4a|flac|ogg|opus|aac|mp4|mkv|webm|mov)$/i;
 
-/** A target is protected when it is, or contains, any referenced path. */
+/** Windows paths compare without case, as path.relative does there. */
+const pathKey = (value: string) => {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * A target is protected when it is, or contains, any referenced path.
+ *
+ * Collections ask this for every file of the task storage. Comparing each file
+ * with every reference grew with both, and after a few batches of hundreds of
+ * files startup waited minutes for it. References and all of their parent
+ * directories are indexed instead; references added to the set later (expansion
+ * keeps adding while it checks) are picked up by indexing again.
+ */
 export function createProtector(references: Set<string>) {
-  return (target: string) =>
-    [...references].some(
-      (ref) => path.relative(target, ref) === '' || within(target, ref),
-    );
+  const exact = new Set<string>();
+  const containing = new Set<string>();
+  let indexed = -1;
+  const index = () => {
+    if (indexed === references.size) return;
+    exact.clear();
+    containing.clear();
+    for (const reference of references) {
+      const resolved = path.resolve(reference);
+      exact.add(pathKey(resolved));
+      for (
+        let parent = path.dirname(resolved), child = resolved;
+        parent !== child;
+        child = parent, parent = path.dirname(parent)
+      ) {
+        const key = pathKey(parent);
+        // Its own parents were added together with it.
+        if (containing.has(key)) break;
+        containing.add(key);
+      }
+    }
+    indexed = references.size;
+  };
+  return (target: string) => {
+    index();
+    const key = pathKey(target);
+    return exact.has(key) || containing.has(key);
+  };
 }
 
 /** Rejects junctions before the recursive removal, then tallies what was reclaimed. */
@@ -77,6 +115,9 @@ export async function collectTaskRunGarbage(
     // Read persistent JSON before deleting anything: old versions stored references
     // inside proofread metadata, not just in manifest projections.
     const inventories = new Map<string, string[]>();
+    // The paths each JSON file names. Every file is parsed once: the passes below
+    // used to parse all of them again on every round.
+    const namedPaths = new Map<string, string[]>();
     for (const directory of store.projectDirectoriesAll()) {
       const files = await walkFiles(directory);
       inventories.set(directory, files);
@@ -89,6 +130,7 @@ export async function collectTaskRunGarbage(
             value?.schemaVersion !== 1
           )
             throw new Error('TASK_RUN_VERSION_UNSUPPORTED');
+          namedPaths.set(file, [...referencedPaths(value)]);
         }
     }
     let previousSize = -1;
@@ -106,7 +148,8 @@ export async function collectTaskRunGarbage(
               !file.split(path.sep).includes('artifacts') ||
               references.has(file)
             )
-              referencedPaths(readJson(file), references);
+              for (const reference of namedPaths.get(file) ?? [])
+                references.add(reference);
           }
       }
     }
@@ -133,26 +176,31 @@ export async function collectTaskRunGarbage(
           await fs.promises.rmdir(directory);
           continue;
         }
-        const orphanBundles = new Set<string>();
-        for (const file of files) {
+        // The artifact bundle a file belongs to: its path up to the first
+        // `artifacts` directory and one level below it.
+        const bundleOf = (file: string) => {
           const parts = path.relative(directory, file).split(path.sep);
           const index = parts.indexOf('artifacts');
-          if (index >= 0 && index + 1 < parts.length) {
-            const bundle = path.join(directory, ...parts.slice(0, index + 2));
-            if (
-              !busy.some((dir) => within(dir, bundle)) &&
-              !protectedPath(bundle)
-            )
-              orphanBundles.add(bundle);
-          }
+          return index >= 0 && index + 1 < parts.length
+            ? path.join(directory, ...parts.slice(0, index + 2))
+            : undefined;
+        };
+        const orphanBundles = new Set<string>();
+        for (const file of files) {
+          const bundle = bundleOf(file);
+          if (
+            bundle &&
+            !orphanBundles.has(bundle) &&
+            !busy.some((dir) => within(dir, bundle)) &&
+            !protectedPath(bundle)
+          )
+            orphanBundles.add(bundle);
         }
         for (const bundle of orphanBundles) await remove(bundle);
         for (const file of files) {
-          if (
-            orphanBundles.size &&
-            [...orphanBundles].some((dir) => within(dir, file))
-          )
-            continue;
+          const bundle = bundleOf(file);
+          // A file inside a removed bundle is gone with it.
+          if (bundle && orphanBundles.has(bundle) && bundle !== file) continue;
           if (busy.some((dir) => within(dir, file)) || protectedPath(file))
             continue;
           const parts = path.relative(directory, file).split(path.sep);
