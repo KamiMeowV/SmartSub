@@ -243,7 +243,9 @@ export function cleanTaskStorage() {
       )
         return { files: 0, bytes: 0, errors: ['TASK_STORAGE_BUSY'] };
       const references = await collectStorageReferences();
-      return collectTaskRunGarbage(manifests, { references });
+      const report = await collectTaskRunGarbage(manifests, { references });
+      if (!report.errors.length) store.set(COLLECTED_AT_KEY, Date.now());
+      return report;
     }),
   )
     .catch((error) => ({ files: 0, bytes: 0, errors: [String(error)] }))
@@ -251,6 +253,32 @@ export function cleanTaskStorage() {
       cleanup = undefined;
     });
   return cleanup;
+}
+
+const COLLECTED_AT_KEY = 'taskStorageCollectedAt';
+const STARTUP_COLLECTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The collection before the first window. Deleting a task reclaims its data at
+ * once and every stage removes its own workspace, so a full scan of the task
+ * storage only finds what a crash or a failed cleanup left behind. The scan reads
+ * every record and file there, and once a few large batches had run it held the
+ * window back for minutes. It now runs when the previous run did not end cleanly
+ * and otherwise at most once a day; the settings page can still run it any time.
+ */
+export async function cleanTaskStorageAtStartup(
+  previousRunEndedCleanly: boolean,
+  now = Date.now(),
+) {
+  const last = store.get(COLLECTED_AT_KEY);
+  if (
+    previousRunEndedCleanly &&
+    typeof last === 'number' &&
+    last <= now &&
+    now - last < STARTUP_COLLECTION_INTERVAL_MS
+  )
+    return null;
+  return cleanTaskStorage();
 }
 
 /**

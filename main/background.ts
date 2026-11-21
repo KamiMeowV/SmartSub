@@ -5,7 +5,7 @@ import { backgroundOnly } from './automation/bootstrap';
 import {
   recoverTaskStorageMigration,
   setupTaskStorageHandlers,
-  cleanTaskStorage,
+  cleanTaskStorageAtStartup,
   taskRunMigration,
 } from './helpers/taskRuns/storageRuntime';
 import { createWindowPort } from './automation/events';
@@ -48,7 +48,10 @@ import {
   initCrashDiagnostics,
   markCrashMonitorShuttingDown,
 } from './helpers/crash/crashReporting';
-import { markCleanExit } from './helpers/crash/runLifecycle';
+import {
+  getPreviousRunAssessment,
+  markCleanExit,
+} from './helpers/crash/runLifecycle';
 import { setupAppMenu } from './helpers/menu';
 import {
   setupWindowCloseBehavior,
@@ -341,7 +344,9 @@ app.on('before-quit', (event) => {
   initializeWorkItemStore();
   initializeTaskRuns();
   setupTaskStorageHandlers();
-  await cleanTaskStorage();
+  await cleanTaskStorageAtStartup(
+    getPreviousRunAssessment()?.status === 'clean',
+  );
   setupWorkItemHandlers();
   setupRecipeHandlers();
   setupGlossaryHandlers(mainWindow);
