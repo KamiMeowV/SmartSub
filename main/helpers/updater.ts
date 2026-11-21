@@ -23,6 +23,24 @@ autoUpdater.logger = {
 
 import { getBuildInfo } from './buildInfo';
 
+/**
+ * The repository this build updates from has never published a release (a build
+ * made in a fork): there is nothing newer, which is not an error to show. An empty
+ * release feed fails in the XML reader with this message; a feed whose entries
+ * name no usable tag fails with the updater's own code.
+ */
+const noPublishedRelease = (error: unknown) => {
+  const { code, message } = (error ?? {}) as {
+    code?: string;
+    message?: string;
+  };
+  return (
+    code === 'ERR_UPDATER_NO_PUBLISHED_VERSIONS' ||
+    (code === 'ERR_XML_MISSED_ELEMENT' &&
+      message === 'No published versions on GitHub')
+  );
+};
+
 export function setupAutoUpdater(mainWindow: BrowserWindow) {
   // 针对Mac平台的特殊处理
   const isMacOS = process.platform === 'darwin';
@@ -53,7 +71,8 @@ export function setupAutoUpdater(mainWindow: BrowserWindow) {
       const result = await autoUpdater.checkForUpdates();
       return result;
     } catch (error) {
-      logMessage(`Error checking for updates: ${error.message}`, 'error');
+      if (!noPublishedRelease(error))
+        logMessage(`Error checking for updates: ${error.message}`, 'error');
       return null;
     }
   };
@@ -92,6 +111,14 @@ export function setupAutoUpdater(mainWindow: BrowserWindow) {
   });
 
   autoUpdater.on('error', (error) => {
+    if (noPublishedRelease(error)) {
+      logMessage(
+        'Update check: no release has been published for this build yet',
+        'info',
+      );
+      mainWindow.webContents.send('update-status', { status: 'not-available' });
+      return;
+    }
     logMessage(`Update error: ${error.message}`, 'error'); // Restored original log message for error
     mainWindow.webContents.send('update-status', {
       status: 'error',
